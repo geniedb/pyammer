@@ -1,0 +1,138 @@
+#!/usr/bin/python
+
+import argparse
+import random
+import string
+import cf
+import time
+import bisect
+
+class CFError(Exception):
+    def __init__(self, res):
+        self.res=res
+        
+    def __str__(self):
+        return "{code}: {msg}".format(code=self.res, msg=cf.resultMessage(self.res))
+
+class TestError(AssertionError):
+    pass
+
+def check(res):
+    if res is not cf.success:
+        raise CFError(res)
+
+class Pyammer(object):
+    def __init__(self, db, verbose):
+        self.con = cf.CloudFabric()
+        self.db = db
+        self.verbose = verbose
+        self.tables = dict()
+        self.reads = 0
+        self.creates = 0
+        self.writes = 0
+        
+    def log(self, msg):
+        if self.verbose:
+            print msg
+    
+    def create_table(self, table=None):
+        if table is None:
+            table = self.random_string()
+        self.log("Adding table {table}".format(table=table))
+        check(self.con.createTable(self.db, table))
+        self.tables[table] = dict()
+        self.creates += 1
+        self.create_record(table=table)
+    
+    def create_record(self, table=None, pk = None):
+        if table is None:
+            table = random.choice(self.tables.keys())
+        if pk is None:
+            pk = self.random_string()
+        fields=self.random_tuples()
+        self.log("Adding record {pk}:{record} to {table}".format(pk=pk, table=table, record=fields))
+        rec = cf.Record()
+        rec.key = pk
+        rec.fields = self.fields_from_tuples(fields)
+        check(self.con.set(self.db, table, rec))
+        self.tables[table][pk] = fields
+        self.writes += 1
+    
+    def read_record(self, table=None, pk=None):
+        if table is None:
+            table = random.choice(self.tables.keys())
+        if pk is None:
+            pk = random.choice(self.tables[table].keys())
+        self.log("Fetching {pk} from {table}".format(pk=pk, table=table))
+        rec = cf.Record()
+        check(self.con.get_simple(rec, self.db, table, pk))
+        self.compare_record(rec, self.tables[table][pk])
+        self.reads += 1
+        
+    
+    def verify(self):
+        self.log("Verifying")
+        rec = cf.Record()
+        for table, records in self.tables.iteritems():
+            for pk, fields in records.iteritems():
+                check(self.con.get_simple(rec, self.db, table, pk))
+                self.compare_record(rec,fields)
+                    
+    def compare_record(self, rec, tuples):
+        assert len(rec.fields) == len(tuples) 
+        for field in rec.fields:
+            assert dict(tuples)[field.first] == field.second
+        
+    
+    def random_string(self):
+        return ''.join(random.choice(string.lowercase) for _ in xrange(random.randint(5,10)))
+    
+    def random_tuples(self):
+        return [(self.random_string(), self.random_string()) for _ in xrange(random.randint(2,6))]
+    
+    def fields_from_tuples(self, tuples):
+        fld = cf.fields_type()
+        for (k,v) in tuples:
+            fld.append(cf.field_type(k,v))
+        return fld
+        
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=
+            """Create and check many CloudFabric tables and records.
+
+This program randomly creates tables and records and inserts them
+into the cloudfabric database.  It can time and verify the records
+added. This allows pyammer to be used as both a performance and test
+tool.
+
+Most people will simply want to run:
+pyammer --verify --time""",
+            formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--write-rate", help="Average number of writes per read.", default=[0.1], type=float, metavar="N", nargs=1)
+    ap.add_argument("--table-create-rate", help="Average number of table creates per read.", default=[0.001], type=float, metavar="N", nargs=1)
+    ap.add_argument("--database", help="Database in which to create tables.", default=["pyammer"], metavar="DB", nargs=1)
+    ap.add_argument("--count", help="Number of actions to take.", type=int, default=[1000], metavar="N", nargs=1)
+    ap.add_argument("--verify", help="Check records correctly saved.", action='store_true')
+    ap.add_argument("--time", help="Time length of actions and produce stats.", action='store_true')
+    ap.add_argument("--verbose", help="Report progress.", action='store_true')
+    params = ap.parse_args()
+    p = Pyammer(db=params.database[0],verbose=params.verbose)
+    
+    if params.time:
+        start = time.time()
+    
+    p.create_table()
+
+    actions = [p.create_table, p.create_record, p.read_record]
+    cweights = [params.table_create_rate[0], params.table_create_rate[0] + params.write_rate[0], params.table_create_rate[0] + params.write_rate[0]+1]
+    while p.creates+p.reads+p.writes < params.count[0]:
+        actions[bisect.bisect_right(cweights, random.random() * cweights[2])]()
+    
+    if params.time:
+        secs=time.time()-start
+        print "took {secs} seconds to do {reads} reads, {writes} writes and {creates} table creates".format(secs=secs, reads=p.reads, writes=p.writes, creates=p.creates)
+        print "rate = {rate} s^-1".format(rate=params.count[0]/secs)
+        print "period = {period} s".format(period=secs/params.count[0])
+        
+    if params.verify:
+        p.verify()
